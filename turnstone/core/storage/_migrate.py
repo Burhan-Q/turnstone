@@ -16,6 +16,9 @@ def run_migrations(storage: Any, backend: str) -> None:
 
     For SQLite backends, also handles bootstrapping existing databases
     that were created before the migration system existed.
+
+    For PostgreSQL, acquires an advisory lock so only one process runs
+    migrations at a time (multiple containers share the same database).
     """
     from alembic import command
     from alembic.config import Config
@@ -31,13 +34,32 @@ def run_migrations(storage: Any, backend: str) -> None:
     if backend == "sqlite":
         _bootstrap_existing_sqlite(engine, cfg)
 
-    try:
-        command.upgrade(cfg, "head")
-    except Exception as exc:
-        if backend == "sqlite":
+    if backend == "postgresql":
+        _run_with_pg_lock(engine, cfg)
+    else:
+        try:
+            command.upgrade(cfg, "head")
+        except Exception as exc:
             log.warning("Migration failed (non-fatal for SQLite): %s", exc)
-        else:
-            raise
+
+
+def _run_with_pg_lock(engine: Any, cfg: Any) -> None:
+    """Run Alembic upgrade under a PostgreSQL advisory lock.
+
+    Advisory lock ID 7_475_283 (arbitrary, derived from 'turnstone').
+    ``pg_advisory_lock`` blocks until the lock is available, so
+    concurrent containers wait in line rather than racing.
+    """
+    import sqlalchemy as sa
+    from alembic import command
+
+    with engine.connect() as conn:
+        conn.execute(sa.text("SELECT pg_advisory_lock(7475283)"))
+        try:
+            command.upgrade(cfg, "head")
+        finally:
+            conn.execute(sa.text("SELECT pg_advisory_unlock(7475283)"))
+            conn.commit()
 
 
 def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:
@@ -58,11 +80,14 @@ def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:
         if has_alembic:
             return  # Already managed by Alembic
 
-        # Check if sessions table exists (indicates pre-existing database)
-        has_sessions = conn.execute(
-            sa.text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'")
+        # Check if a known table exists (indicates pre-existing database)
+        has_tables = conn.execute(
+            sa.text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name IN ('sessions', 'workstreams')"
+            )
         ).fetchone()
-        if has_sessions:
+        if has_tables:
             log.info("Bootstrapping existing database into Alembic (stamping at baseline)")
             command.stamp(cfg, "001")
 

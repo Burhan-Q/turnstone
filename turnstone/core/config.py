@@ -105,6 +105,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     },
     "mcp": {
         "config_path": "mcp_config",
+        "refresh_interval": "mcp_refresh_interval",
     },
     "ratelimit": {
         "enabled": "ratelimit_enabled",
@@ -151,6 +152,16 @@ def get_tavily_key() -> str | None:
     if env_key:
         _tavily_key = env_key
     return _tavily_key
+
+
+def nonneg_float(val: str) -> float:
+    """Argparse type for non-negative floats (``>= 0``)."""
+    f = float(val)
+    if f < 0:
+        import argparse
+
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return f
 
 
 def apply_config(parser: argparse.ArgumentParser, sections: list[str]) -> None:

@@ -1277,6 +1277,16 @@ def main() -> None:
         metavar="PATH",
         help="Path to MCP server config file (standard mcpServers JSON format)",
     )
+
+    from turnstone.core.config import nonneg_float
+
+    parser.add_argument(
+        "--mcp-refresh-interval",
+        type=nonneg_float,
+        default=14400,
+        metavar="SECONDS",
+        help="Periodic MCP tool refresh interval for servers without push notifications (default: 14400 = 4h, 0 to disable)",
+    )
     parser.add_argument(
         "--max-workstreams",
         type=int,
@@ -1404,7 +1414,10 @@ def main() -> None:
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
 
-    mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
+    mcp_client = create_mcp_client(
+        getattr(args, "mcp_config", None),
+        refresh_interval=getattr(args, "mcp_refresh_interval", 14400),
+    )
 
     # Backend health monitor with circuit breaker
     from turnstone.core.healthcheck import BackendHealthMonitor

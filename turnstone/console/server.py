@@ -40,7 +40,7 @@ from turnstone.console.collector import ClusterCollector
 from turnstone.core.auth import JWT_AUD_CONSOLE, AuthMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from starlette.requests import Request
 
@@ -607,43 +607,21 @@ async def _proxy_sse(
                     )
                     yield f"event: error\ndata: Upstream returned status {response.status_code}\n\n".encode()
                     return
-                byte_iter = response.aiter_bytes().__aiter__()
-
-                async def _read_next(it: AsyncIterator[bytes]) -> bytes:
-                    return await it.__anext__()
-
-                read_task: asyncio.Task[bytes] | None = None
-                try:
-                    while True:
-                        if await request.is_disconnected():
-                            return
-                        if read_task is None:
-                            read_task = asyncio.create_task(_read_next(byte_iter))
-                        ping_wait = asyncio.create_task(asyncio.sleep(3))
-                        done, _ = await asyncio.wait(
-                            {read_task, ping_wait},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if read_task in done:
-                            ping_wait.cancel()
-                            try:
-                                yield read_task.result()
-                            except StopAsyncIteration:
-                                return
-                            read_task = None
-                        else:
-                            # No upstream data in 3s — keepalive comment
-                            yield b": proxy-ping\n\n"
-                finally:
-                    if read_task is not None:
-                        read_task.cancel()
+                async for chunk in response.aiter_bytes():
+                    if await request.is_disconnected():
+                        return
+                    yield chunk
         except httpx.HTTPError:
             log.debug("SSE proxy stream ended for %s", target)
 
     return StreamingResponse(
         raw_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -663,6 +641,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Separate client for SSE streams — longer read timeout, shared connection pool
     app.state.proxy_sse_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
+        limits=httpx.Limits(keepalive_expiry=30),
         headers=headers,
     )
     # Start scheduler if configured

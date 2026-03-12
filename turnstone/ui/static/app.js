@@ -1570,20 +1570,45 @@ function scrollToBottom(force) {
 }
 
 // --- Plan review dialog ---
+var _planContent = "";
 function showPlanDialog(content) {
+  _planContent = content;
   document.getElementById("plan-content").textContent = content;
-  document.getElementById("plan-feedback").value = "";
+  var feedbackEl = document.getElementById("plan-feedback");
+  feedbackEl.value = "";
+  _updatePlanRejectBtn();
+  inputEl.disabled = true;
+  sendBtn.disabled = true;
   document.getElementById("plan-overlay").classList.add("active");
   setTimeout(function () {
-    document.getElementById("plan-feedback").focus();
+    feedbackEl.focus();
   }, 50);
+}
+
+function _updatePlanRejectBtn() {
+  var btn = document.getElementById("btn-plan-reject");
+  var hasFeedback =
+    document.getElementById("plan-feedback").value.trim().length > 0;
+  btn.innerHTML = hasFeedback
+    ? '<span class="key">Esc</span> Amend'
+    : '<span class="key">Esc</span> Reject';
+  btn.style.background = hasFeedback ? "var(--accent)" : "";
+  btn.style.color = hasFeedback ? "var(--on-color)" : "";
+  btn.onclick = function () {
+    resolvePlan(hasFeedback ? "" : "reject");
+  };
 }
 
 function resolvePlan(defaultFeedback) {
   let feedback = document.getElementById("plan-feedback").value.trim();
   if (!feedback && defaultFeedback) feedback = defaultFeedback;
   document.getElementById("plan-overlay").classList.remove("active");
+  inputEl.disabled = false;
+  sendBtn.disabled = false;
   inputEl.focus();
+
+  // Critical: fire the API call first — this unblocks the server.
+  // The inline rendering below is cosmetic and must never prevent it.
   authFetch("/v1/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1591,6 +1616,65 @@ function resolvePlan(defaultFeedback) {
   }).catch(function (err) {
     addErrorMessage("Connection error: " + err.message);
   });
+
+  // Render plan inline in the chat (best-effort)
+  try {
+    var isReject = feedback === "reject";
+    var isAmend = feedback && !isReject;
+    var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
+    _addInlinePlan(_planContent, action, feedback);
+  } catch (err) {
+    console.error("Failed to render inline plan:", err);
+    addInfoMessage("Plan " + action);
+  }
+
+  // Show spinner while the model processes the plan result
+  setBusy(true);
+  addThinkingIndicator();
+}
+
+function _addInlinePlan(content, action, feedback) {
+  if (!content) return;
+  var wrapper = document.createElement("div");
+  wrapper.className = "plan-inline";
+
+  var header = document.createElement("div");
+  header.className = "plan-inline-header";
+  var label =
+    action === "rejected"
+      ? "Plan rejected"
+      : action === "amending"
+        ? "Plan — amending"
+        : "Plan approved";
+  header.innerHTML =
+    '<span class="plan-inline-label plan-' + action + '">' + label + "</span>";
+  wrapper.appendChild(header);
+
+  var body = document.createElement("div");
+  body.className = "plan-inline-body";
+  try {
+    body.innerHTML = renderMarkdown(content);
+  } catch (e) {
+    body.textContent = content;
+  }
+  if (content.split("\n").length > 12) {
+    makeCollapsible(body);
+    body.setAttribute(
+      "aria-label",
+      "Plan content (collapsed). Activate to expand.",
+    );
+  }
+  wrapper.appendChild(body);
+
+  if (feedback && action === "amending") {
+    var fb = document.createElement("div");
+    fb.className = "plan-inline-feedback";
+    fb.textContent = "Feedback: " + feedback;
+    wrapper.appendChild(fb);
+  }
+
+  messagesEl.appendChild(wrapper);
+  scrollToBottom();
 }
 
 // --- Send message ---
@@ -1647,6 +1731,9 @@ function autoResize() {
 }
 
 inputEl.addEventListener("input", autoResize);
+document
+  .getElementById("plan-feedback")
+  .addEventListener("input", _updatePlanRejectBtn);
 inputEl.addEventListener("keydown", function (e) {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -1749,7 +1836,9 @@ document.addEventListener("keydown", function (e) {
       resolvePlan("");
     } else if (e.key === "Escape") {
       e.preventDefault();
-      resolvePlan("reject");
+      var hasFb =
+        document.getElementById("plan-feedback").value.trim().length > 0;
+      resolvePlan(hasFb ? "" : "reject");
     } else if (e.key === "Tab") {
       var focusable = document.querySelectorAll(
         "#plan-dialog input, #plan-dialog button",

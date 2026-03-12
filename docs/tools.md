@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 16 built-in tools plus any number of external MCP tools to the
+turnstone exposes 18 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -46,12 +46,12 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 16 tool definitions (sent to the model). |
+| `TOOLS`             | All 18 tool definitions (sent to the model). |
 | `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 16 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 18 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -69,7 +69,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 15
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 18
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -168,6 +168,8 @@ Every tool defines a `primary_key`. The mapping is:
 | `recall`     | `query`     |
 | `forget`     | `key`       |
 | `notify`     | `message`   |
+| `read_resource` | `uri`    |
+| `use_prompt` | `name`     |
 
 ---
 
@@ -517,6 +519,8 @@ data.get("mergedAt") is not None
 | `forget`     | Memory     | Yes          | No    | No         | `key`       |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
 | `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
+| `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
+| `use_prompt` | MCP        | No           | Yes   | Yes        | `name`      |
 | `tool_search`| Search     | Yes          | No    | No         | `query`     |
 
 ---
@@ -569,7 +573,7 @@ CLI flags override the config file:
    search stays off and all tools are sent to the model directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
-   - **Always-on** -- the 15 built-in tools (members of `BUILTIN_TOOL_NAMES`).
+   - **Always-on** -- the 18 built-in tools (members of `BUILTIN_TOOL_NAMES`).
      These are always visible to the model.
    - **Deferred** -- all MCP tools. These are not sent in the tool list unless
      the model searches for them.
@@ -593,6 +597,8 @@ where the model can interactively search for tools it needs.
 
 ## MCP Tools (External)
 
+> See also: [MCP Architecture diagram](diagrams/png/20-mcp-architecture.png)
+
 Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/)
 (MCP) for connecting external tool servers — GitHub, databases, filesystems, or any
 MCP-compatible service.
@@ -610,7 +616,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 15 built-in tools via
+4. **Merging**: MCP tools are appended after the 18 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see
@@ -729,3 +735,140 @@ MCP refresh complete:
 MCP refresh complete:
   github: no changes
 ```
+
+---
+
+## MCP Resources
+
+MCP servers can expose **resources** -- named data items (files, database rows,
+API responses) addressable by URI. turnstone discovers resources at startup and
+makes them available to the model via the `read_resource` built-in tool.
+
+### Discovery
+
+During the MCP `initialize` handshake, `MCPClientManager` checks each server's
+capabilities for the `resources` capability. For servers that declare it:
+
+1. `list_resources` fetches static resources (fixed URIs).
+2. `list_resource_templates` fetches URI templates (parameterized patterns like
+   `db://tables/{table}/rows/{id}`).
+
+Both are stored as `{uri, name, description, mimeType, server}` dicts and
+merged into a unified catalog.
+
+### Resource catalog in system message
+
+The first 50 resources are injected into the system message as an XML-delimited
+block so the model knows what URIs are available:
+
+```xml
+<mcp-resources>
+  file:///project/README.md  Project readme
+  db://users/schema  User table schema
+</mcp-resources>
+Use read_resource(uri='...') to access the resources listed above.
+```
+
+### read_resource tool
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `uri`     | string | yes      | The resource URI to read. |
+
+- **What it does**: Reads the resource from its MCP server via `MCPClientManager.read_resource_sync()`. Returns text content for text resources or base64-encoded data for binary resources. Output is truncated by the standard tool output limiter.
+- **Auto-approve**: No -- requires user confirmation (reads external data).
+- **Agent availability**: `agent` and `task_agent`.
+
+### Capability guards
+
+The `read_resource` tool schema is always loaded (it is a built-in JSON schema),
+but resource discovery only runs for servers that declare the `resources`
+capability. Servers without the capability contribute zero resources to the
+catalog.
+
+### Refresh
+
+Resource lists stay current through the same three-tier mechanism as tool lists:
+
+1. **Push** -- Servers declaring `resources.listChanged: true` send
+   `notifications/resources/list_changed`, triggering an immediate refresh.
+2. **Periodic** -- Servers without push are polled on the configured refresh
+   interval (default 4 hours, same timer as tools).
+3. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+
+---
+
+## MCP Prompts
+
+MCP servers can also expose **prompts** -- reusable message templates with
+optional arguments. turnstone discovers prompts at startup for servers that
+declare the `prompts` capability.
+
+### Discovery
+
+Prompt discovery mirrors resource discovery: `list_prompts` is called during
+the `initialize` handshake. Each prompt is stored with its prefixed name
+(`mcp__{server}__{prompt}`), description, and argument schema.
+
+### use_prompt tool
+
+| Parameter   | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `name`      | string | yes      | The prompt name (e.g. `mcp__server__prompt_name`). |
+| `arguments` | object | no       | Key-value argument pairs for the prompt. Values must be strings. |
+
+- **What it does**: Invokes an MCP prompt template by name via `MCPClientManager.get_prompt_sync()`, expanding it into messages. Returns the expanded prompt content formatted as `[role]: content` blocks joined with blank lines. The prompt catalog is listed in the system message so the model knows which prompts are available. Output is truncated by the standard tool output limiter.
+- **Auto-approve**: No -- requires user confirmation (invokes external prompt servers).
+- **Agent availability**: `agent` and `task_agent`.
+
+### Invocation
+
+`MCPClientManager.get_prompt_sync()` calls the server's `get_prompt` method
+with the provided arguments and returns the expanded messages. The `use_prompt`
+built-in tool exposes this to the model as a function call.
+
+### Governance Sync
+
+Discovered MCP prompts are automatically synced into the `prompt_templates`
+governance table as first-class governed templates:
+
+- **Origin tracking**: MCP-sourced templates have `origin="mcp"` and
+  `mcp_server` set to the server name. Manual templates have
+  `origin="manual"`.
+- **Read-only**: MCP-sourced templates are `readonly=True`. The admin API
+  returns 403 on update/delete attempts. The admin UI disables edit/delete
+  buttons and shows an origin badge.
+- **Precedence**: If a manual template and MCP prompt share the same name,
+  the manual template wins and the MCP prompt is skipped (with a log
+  warning).
+- **Lifecycle**: Templates are created on connect, updated on prompt list
+  refresh, and removed when the MCP server no longer exposes the prompt.
+  The sync runs automatically on connect, on `PromptListChangedNotification`,
+  and on manual `/mcp refresh`.
+- **Schema**: Migration 009 adds `origin`, `mcp_server`, and `readonly`
+  columns to the `prompt_templates` table.
+
+The `use_prompt` tool allows the model to invoke any discovered MCP prompt at
+runtime. A catalog of up to 30 prompts is injected into the system message
+inside `<mcp-prompts>` XML tags so the model can discover available prompts.
+
+---
+
+## MCP UI Visibility
+
+MCP server, resource, and prompt counts are surfaced across the UI:
+
+- **Server `/health` endpoint**: Returns `mcp.servers`, `mcp.resources`,
+  `mcp.prompts` when MCP is configured
+- **Server UI**: Magenta status badge in the header showing server count,
+  with resource/prompt counts in tooltip
+- **Console cluster status bar**: MCP metrics (servers/resources/prompts)
+  with magenta LED dot indicator, shown after a divider from workstream
+  metrics
+- **Console node detail**: Per-node MCP summary showing server, resource,
+  and prompt counts
+- **Console collector**: Aggregates MCP counts across all nodes in the
+  cluster overview
+
+MCP indicators use the `--magenta` design token for consistent theming
+across light and dark modes.

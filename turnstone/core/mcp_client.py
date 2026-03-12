@@ -1,16 +1,16 @@
 """MCP (Model Context Protocol) client manager.
 
-Connects to external MCP tool servers and exposes their tools alongside
-turnstone's built-in tools.
+Connects to external MCP tool servers and exposes their tools, resources,
+and prompts alongside turnstone's built-in capabilities.
 
 Architecture: the MCP SDK is fully async, but turnstone's ChatSession is
 synchronous.  We bridge the two by running a dedicated asyncio event loop
 in a daemon thread.  ``call_tool_sync`` dispatches coroutines onto that loop
 via ``asyncio.run_coroutine_threadsafe``.
 
-Tool refresh: three mechanisms keep tool lists up-to-date without restart:
-  1. Push notifications — servers declaring ``tools.listChanged`` trigger
-     immediate refresh via ``ToolListChangedNotification``.
+Refresh: three mechanisms keep tool/resource/prompt lists up-to-date:
+  1. Push notifications — servers declaring ``listChanged`` on the
+     respective capability trigger immediate refresh.
   2. Periodic timer — servers *without* push support are polled on a
      staggered interval (configurable, default 4 h, seeded at launch).
   3. Manual — ``/mcp refresh [server]`` triggers ``refresh_sync()``.
@@ -19,6 +19,7 @@ Tool refresh: three mechanisms keep tool lists up-to-date without restart:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -26,6 +27,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -112,6 +114,28 @@ class MCPClientManager:
         self._listeners: list[Callable[[], None]] = []
         self._listeners_lock = threading.Lock()
 
+        # Resources — parallel to tools
+        self._per_server_resources: dict[str, list[dict[str, Any]]] = {}
+        self._resources: list[dict[str, Any]] = []
+        self._resource_map: dict[str, tuple[str, str]] = {}  # uri → (server, uri)
+        self._supports_resources: dict[str, bool] = {}  # server has resources capability
+        self._supports_resource_list_changed: dict[str, bool] = {}
+        self._resource_listeners: list[Callable[[], None]] = []
+        self._resource_listeners_lock = threading.Lock()
+
+        # Prompts — parallel to tools
+        self._per_server_prompts: dict[str, list[dict[str, Any]]] = {}
+        self._prompts: list[dict[str, Any]] = []
+        self._prompt_map: dict[str, tuple[str, str]] = {}  # prefixed → (server, original)
+        self._supports_prompts: dict[str, bool] = {}  # server has prompts capability
+        self._supports_prompt_list_changed: dict[str, bool] = {}
+        self._prompt_listeners: list[Callable[[], None]] = []
+        self._prompt_listeners_lock = threading.Lock()
+
+        # Governance storage (optional — set via set_storage())
+        self._storage: Any = None
+        self._sync_lock = threading.Lock()
+
         # Periodic refresh for servers without push notifications
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
@@ -146,7 +170,16 @@ class MCPClientManager:
 
         # Start periodic refresh for servers without push notifications
         needs_periodic = any(
-            not self._supports_list_changed.get(name, False) for name in self._sessions
+            not self._supports_list_changed.get(name, False)
+            or (
+                self._supports_resources.get(name, False)
+                and not self._supports_resource_list_changed.get(name, False)
+            )
+            or (
+                self._supports_prompts.get(name, False)
+                and not self._supports_prompt_list_changed.get(name, False)
+            )
+            for name in self._sessions
         )
         if needs_periodic and self._refresh_interval > 0:
             self._refresh_task = asyncio.get_running_loop().create_task(self._periodic_refresh())
@@ -178,20 +211,26 @@ class MCPClientManager:
             )
             read, write = await self._exit_stack.enter_async_context(stdio_client(params))
 
-        # Register notification handler — lightweight; only acts on
-        # ToolListChangedNotification, which is a no-op if the server
-        # never sends it.
+        # Register notification handler — dispatches tool, resource, and
+        # prompt list-change notifications to the appropriate refresh method.
         async def _on_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            if isinstance(msg, mcp_types.ServerNotification) and isinstance(
-                msg.root, mcp_types.ToolListChangedNotification
-            ):
-                log.info("Received tools/list_changed from '%s'", name)
-                try:
-                    await self._refresh_server(name)
-                except Exception:
-                    log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
+            if not isinstance(msg, mcp_types.ServerNotification):
+                return
+            root = msg.root
+            try:
+                if isinstance(root, mcp_types.ToolListChangedNotification):
+                    log.info("Received tools/list_changed from '%s'", name)
+                    await self._refresh_server_tools(name)
+                elif isinstance(root, mcp_types.ResourceListChangedNotification):
+                    log.info("Received resources/list_changed from '%s'", name)
+                    await self._refresh_server_resources(name)
+                elif isinstance(root, mcp_types.PromptListChangedNotification):
+                    log.info("Received prompts/list_changed from '%s'", name)
+                    await self._refresh_server_prompts(name)
+            except Exception:
+                log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
 
         session = await self._exit_stack.enter_async_context(
             ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
@@ -199,10 +238,21 @@ class MCPClientManager:
         await session.initialize()
         self._sessions[name] = session
 
-        # Check push notification support
+        # Check push notification support for each capability
         caps = session.get_server_capabilities()
+
         tools_cap = getattr(caps, "tools", None) if caps else None
         self._supports_list_changed[name] = bool(getattr(tools_cap, "listChanged", False))
+
+        resources_cap = getattr(caps, "resources", None) if caps else None
+        self._supports_resources[name] = resources_cap is not None
+        self._supports_resource_list_changed[name] = bool(
+            getattr(resources_cap, "listChanged", False)
+        )
+
+        prompts_cap = getattr(caps, "prompts", None) if caps else None
+        self._supports_prompts[name] = prompts_cap is not None
+        self._supports_prompt_list_changed[name] = bool(getattr(prompts_cap, "listChanged", False))
 
         # Discover tools
         result = await session.list_tools()
@@ -213,13 +263,87 @@ class MCPClientManager:
         self._per_server_tools[name] = server_tools
         self._rebuild_tools()
 
-        push_status = " (push)" if self._supports_list_changed[name] else ""
+        # Discover resources
+        resource_count = 0
+        if resources_cap is not None:
+            server_resources: list[dict[str, Any]] = []
+            res_result = await session.list_resources()
+            for r in res_result.resources:
+                server_resources.append(
+                    {
+                        "uri": str(r.uri),
+                        "name": r.name or "",
+                        "description": r.description or "",
+                        "mimeType": r.mimeType or "",
+                        "server": name,
+                    }
+                )
+            # Also include resource templates (catalog-only — not directly
+            # readable via read_resource since they contain URI placeholders)
+            tmpl_result = await session.list_resource_templates()
+            for t in tmpl_result.resourceTemplates:
+                server_resources.append(
+                    {
+                        "uri": str(t.uriTemplate),
+                        "name": t.name or "",
+                        "description": t.description or "",
+                        "mimeType": t.mimeType or "",
+                        "server": name,
+                        "template": True,
+                    }
+                )
+            resource_count = len(server_resources)
+            self._per_server_resources[name] = server_resources
+            self._rebuild_resources()
+
+        # Discover prompts
+        prompt_count = 0
+        if prompts_cap is not None:
+            server_prompts: list[dict[str, Any]] = []
+            prompt_result = await session.list_prompts()
+            for p in prompt_result.prompts:
+                server_prompts.append(
+                    {
+                        "name": f"mcp__{name}__{p.name}",
+                        "original_name": p.name,
+                        "server": name,
+                        "description": p.description or "",
+                        "arguments": [
+                            {
+                                "name": a.name,
+                                "description": a.description or "",
+                                "required": a.required or False,
+                            }
+                            for a in (p.arguments or [])
+                        ],
+                    }
+                )
+            prompt_count = len(server_prompts)
+            self._per_server_prompts[name] = server_prompts
+            self._rebuild_prompts()
+
+        push_parts: list[str] = []
+        if self._supports_list_changed[name]:
+            push_parts.append("tools")
+        if self._supports_resource_list_changed[name]:
+            push_parts.append("resources")
+        if self._supports_prompt_list_changed[name]:
+            push_parts.append("prompts")
+        push_status = f" (push: {','.join(push_parts)})" if push_parts else ""
         log.info(
-            "Connected MCP server '%s' — %d tool(s)%s",
+            "Connected MCP server '%s' — %d tool(s), %d resource(s), %d prompt(s)%s",
             name,
             len(result.tools),
+            resource_count,
+            prompt_count,
             push_status,
         )
+
+        # Sync discovered prompts into governance storage
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after connect failed for '%s'", name, exc_info=True)
 
     # -- tool refresh --------------------------------------------------------
 
@@ -242,7 +366,7 @@ class MCPClientManager:
         self._tool_map = new_map
         self._notify_listeners()
 
-    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]]:
+    async def _refresh_server_tools(self, name: str) -> tuple[list[str], list[str]]:
         """Re-fetch tools for one server.  Returns ``(added, removed)`` names."""
         session = self._sessions.get(name)
         if session is None:
@@ -268,10 +392,21 @@ class MCPClientManager:
             )
         return added, removed
 
+    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]]:
+        """Re-fetch tools, resources, and prompts for one server.
+
+        Returns ``(added_tools, removed_tools)`` names (tool diff only,
+        for backward compatibility with ``/mcp refresh`` output).
+        """
+        added, removed = await self._refresh_server_tools(name)
+        await self._refresh_server_resources(name)
+        await self._refresh_server_prompts(name)
+        return added, removed
+
     async def _refresh_all(
         self, server_name: str | None = None
     ) -> dict[str, tuple[list[str], list[str]]]:
-        """Refresh tools for one or all servers.
+        """Refresh tools, resources, and prompts for one or all servers.
 
         For disconnected servers (in config but not connected), attempts
         reconnect.  Returns ``{server: (added, removed)}`` per server.
@@ -297,6 +432,13 @@ class MCPClientManager:
             except Exception:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
                 results[name] = ([], [])
+
+        # Final sync to clean up templates from servers that are no longer connected
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after refresh_all failed", exc_info=True)
+
         return results
 
     def refresh_sync(
@@ -319,15 +461,136 @@ class MCPClientManager:
         await asyncio.sleep(initial_delay)
         while True:
             for name in list(self._server_configs):
-                if self._supports_list_changed.get(name, False):
-                    continue  # has push — skip
                 if name not in self._sessions:
                     continue  # not connected — skip (reconnect on manual refresh)
                 try:
-                    await self._refresh_server(name)
+                    if not self._supports_list_changed.get(name, False):
+                        await self._refresh_server_tools(name)
+                    if not self._supports_resource_list_changed.get(name, False):
+                        await self._refresh_server_resources(name)
+                    if not self._supports_prompt_list_changed.get(name, False):
+                        await self._refresh_server_prompts(name)
                 except Exception:
                     log.warning("Periodic refresh failed for '%s'", name, exc_info=True)
             await asyncio.sleep(self._refresh_interval)
+
+    # -- resource refresh ----------------------------------------------------
+
+    def _rebuild_resources(self) -> None:
+        """Rebuild merged ``_resources`` and ``_resource_map`` from per-server state.
+
+        Uses copy-on-write: builds new objects, then assigns atomically.
+        """
+        new_resources: list[dict[str, Any]] = []
+        new_map: dict[str, tuple[str, str]] = {}
+        for srv_name, srv_resources in self._per_server_resources.items():
+            for res in srv_resources:
+                uri: str = res["uri"]
+                new_resources.append(res)
+                if res.get("template"):
+                    continue  # templates are catalog-only, not directly readable
+                if uri in new_map:
+                    log.warning(
+                        "Resource URI collision: '%s' from '%s' overrides '%s'",
+                        uri,
+                        srv_name,
+                        new_map[uri][0],
+                    )
+                new_map[uri] = (srv_name, uri)
+        self._resources = new_resources
+        self._resource_map = new_map
+        self._notify_resource_listeners()
+
+    async def _refresh_server_resources(self, name: str) -> None:
+        """Re-fetch resources for one server."""
+        if not self._supports_resources.get(name, False):
+            return
+        session = self._sessions.get(name)
+        if session is None:
+            return
+
+        server_resources: list[dict[str, Any]] = []
+        res_result = await session.list_resources()
+        for r in res_result.resources:
+            server_resources.append(
+                {
+                    "uri": str(r.uri),
+                    "name": r.name or "",
+                    "description": r.description or "",
+                    "mimeType": r.mimeType or "",
+                    "server": name,
+                }
+            )
+        tmpl_result = await session.list_resource_templates()
+        for t in tmpl_result.resourceTemplates:
+            server_resources.append(
+                {
+                    "uri": str(t.uriTemplate),
+                    "name": t.name or "",
+                    "description": t.description or "",
+                    "mimeType": t.mimeType or "",
+                    "server": name,
+                    "template": True,
+                }
+            )
+
+        self._per_server_resources[name] = server_resources
+        self._rebuild_resources()
+
+    # -- prompt refresh ------------------------------------------------------
+
+    def _rebuild_prompts(self) -> None:
+        """Rebuild merged ``_prompts`` and ``_prompt_map`` from per-server state.
+
+        Uses copy-on-write: builds new objects, then assigns atomically.
+        """
+        new_prompts: list[dict[str, Any]] = []
+        new_map: dict[str, tuple[str, str]] = {}
+        for srv_name, srv_prompts in self._per_server_prompts.items():
+            for prompt in srv_prompts:
+                prefixed: str = prompt["name"]
+                new_prompts.append(prompt)
+                new_map[prefixed] = (srv_name, prompt["original_name"])
+        self._prompts = new_prompts
+        self._prompt_map = new_map
+        self._notify_prompt_listeners()
+
+    async def _refresh_server_prompts(self, name: str) -> None:
+        """Re-fetch prompts for one server."""
+        if not self._supports_prompts.get(name, False):
+            return
+        session = self._sessions.get(name)
+        if session is None:
+            return
+
+        server_prompts: list[dict[str, Any]] = []
+        prompt_result = await session.list_prompts()
+        for p in prompt_result.prompts:
+            server_prompts.append(
+                {
+                    "name": f"mcp__{name}__{p.name}",
+                    "original_name": p.name,
+                    "server": name,
+                    "description": p.description or "",
+                    "arguments": [
+                        {
+                            "name": a.name,
+                            "description": a.description or "",
+                            "required": a.required or False,
+                        }
+                        for a in (p.arguments or [])
+                    ],
+                }
+            )
+
+        self._per_server_prompts[name] = server_prompts
+        self._rebuild_prompts()
+
+        # Sync discovered prompts into governance storage
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after refresh failed for '%s'", name, exc_info=True)
 
     # -- listener infrastructure ---------------------------------------------
 
@@ -342,7 +605,7 @@ class MCPClientManager:
             self._listeners.remove(callback)
 
     def _notify_listeners(self) -> None:
-        """Invoke all registered listeners (runs on MCP background thread)."""
+        """Invoke all registered tool-change listeners."""
         with self._listeners_lock:
             listeners = list(self._listeners)
         for cb in listeners:
@@ -350,6 +613,151 @@ class MCPClientManager:
                 cb()
             except Exception:
                 log.warning("Tool-change listener raised", exc_info=True)
+
+    def add_resource_listener(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when the resource list changes."""
+        with self._resource_listeners_lock:
+            self._resource_listeners.append(callback)
+
+    def remove_resource_listener(self, callback: Callable[[], None]) -> None:
+        """Unregister a resource-change callback."""
+        with self._resource_listeners_lock, contextlib.suppress(ValueError):
+            self._resource_listeners.remove(callback)
+
+    def _notify_resource_listeners(self) -> None:
+        """Invoke all registered resource-change listeners."""
+        with self._resource_listeners_lock:
+            listeners = list(self._resource_listeners)
+        for cb in listeners:
+            try:
+                cb()
+            except Exception:
+                log.warning("Resource-change listener raised", exc_info=True)
+
+    def add_prompt_listener(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when the prompt list changes."""
+        with self._prompt_listeners_lock:
+            self._prompt_listeners.append(callback)
+
+    def remove_prompt_listener(self, callback: Callable[[], None]) -> None:
+        """Unregister a prompt-change callback."""
+        with self._prompt_listeners_lock, contextlib.suppress(ValueError):
+            self._prompt_listeners.remove(callback)
+
+    def _notify_prompt_listeners(self) -> None:
+        """Invoke all registered prompt-change listeners."""
+        with self._prompt_listeners_lock:
+            listeners = list(self._prompt_listeners)
+        for cb in listeners:
+            try:
+                cb()
+            except Exception:
+                log.warning("Prompt-change listener raised", exc_info=True)
+
+    # -- governance storage sync ---------------------------------------------
+
+    def set_storage(self, storage: Any) -> None:
+        """Inject governance storage backend for prompt template sync.
+
+        If MCP servers are already connected, triggers an immediate sync
+        so prompts discovered during startup appear in governance storage
+        (``start()`` completes before ``set_storage()`` is called).
+        """
+        self._storage = storage
+        if self._connected.is_set():
+            try:
+                self.sync_prompts_to_storage()
+            except Exception:
+                log.warning("Prompt sync after set_storage failed", exc_info=True)
+
+    def sync_prompts_to_storage(self) -> dict[str, Any]:
+        """Sync discovered MCP prompts into the prompt_templates governance table.
+
+        Returns ``{"added": [...], "removed": [...], "skipped": [...]}``.
+        Thread-safe: serialized via ``_sync_lock`` to prevent races
+        between ``set_storage()`` (main thread) and MCP background thread.
+        """
+        if self._storage is None:
+            return {"added": [], "removed": [], "skipped": []}
+
+        with self._sync_lock:
+            return self._sync_prompts_locked()
+
+    def _sync_prompts_locked(self) -> dict[str, Any]:
+        """Inner sync logic — must be called under ``_sync_lock``."""
+        storage = self._storage
+        added: list[str] = []
+        removed: list[str] = []
+        skipped: list[str] = []
+
+        # Current MCP prompt names (the prefixed names used as template names)
+        current_names: set[str] = set()
+
+        for prompt in list(self._prompts):
+            name: str = prompt["name"][:256]
+            server: str = prompt["server"][:128]
+            current_names.add(name)
+
+            # Build content from description + argument schema
+            desc = prompt.get("description", "")[:4096]
+            args_list = prompt.get("arguments", [])
+            content_parts = [desc] if desc else []
+            if args_list:
+                content_parts.append("\nArguments:")
+                for arg in args_list:
+                    req = " (required)" if arg.get("required") else ""
+                    arg_desc = arg.get("description", "")[:512]
+                    content_parts.append(f"  - {arg['name'][:128]}{req}: {arg_desc}")
+            content = "\n".join(content_parts) if content_parts else name
+
+            # Variables = JSON list of argument names
+            variables = json.dumps([a["name"] for a in args_list])
+
+            existing = storage.get_prompt_template_by_name(name)
+            if existing is not None:
+                if existing.get("origin") == "manual":
+                    log.info(
+                        "Skipping MCP prompt '%s' — manual template with same name exists", name
+                    )
+                    skipped.append(name)
+                    continue
+                # Existing MCP template — update content/variables
+                storage.update_prompt_template(
+                    existing["template_id"], content=content, variables=variables
+                )
+            else:
+                # Create new MCP-sourced template
+                template_id = str(uuid.uuid4())
+                storage.create_prompt_template(
+                    template_id=template_id,
+                    name=name,
+                    category="mcp",
+                    content=content,
+                    variables=variables,
+                    is_default=False,
+                    org_id="",
+                    created_by="",
+                    origin="mcp",
+                    mcp_server=server,
+                    readonly=True,
+                )
+                added.append(name)
+
+        # Remove MCP templates whose prompts no longer exist
+        existing_mcp = storage.list_prompt_templates_by_origin("mcp")
+        for tpl in existing_mcp:
+            if tpl["name"] not in current_names:
+                storage.delete_prompt_template(tpl["template_id"])
+                removed.append(tpl["name"])
+
+        if added or removed:
+            log.info(
+                "MCP prompt sync: +%d added, -%d removed, %d skipped",
+                len(added),
+                len(removed),
+                len(skipped),
+            )
+        return {"added": added, "removed": removed, "skipped": skipped}
 
     # -- lifecycle (shutdown) ------------------------------------------------
 
@@ -371,17 +779,60 @@ class MCPClientManager:
         if self._thread:
             self._thread.join(timeout=5)
 
+        # Clear all state
+        self._sessions.clear()
+        self._tools = []
+        self._tool_map = {}
+        self._per_server_tools.clear()
+        self._supports_list_changed.clear()
+        self._resources = []
+        self._resource_map = {}
+        self._per_server_resources.clear()
+        self._supports_resources.clear()
+        self._supports_resource_list_changed.clear()
+        self._prompts = []
+        self._prompt_map = {}
+        self._per_server_prompts.clear()
+        self._supports_prompts.clear()
+        self._supports_prompt_list_changed.clear()
+        # Clear listener lists to release callback references
+        self._listeners.clear()
+        self._resource_listeners.clear()
+        self._prompt_listeners.clear()
+
         log.info("MCP client shut down")
 
     # -- query methods -------------------------------------------------------
 
     def get_tools(self) -> list[dict[str, Any]]:
         """Return MCP tools in OpenAI function-calling format."""
-        return list(self._tools)
+        return [dict(t) for t in self._tools]
+
+    def get_resources(self) -> list[dict[str, Any]]:
+        """Return discovered MCP resources (shallow-copied dicts)."""
+        return [dict(r) for r in self._resources]
+
+    def get_prompts(self) -> list[dict[str, Any]]:
+        """Return discovered MCP prompts (shallow-copied dicts)."""
+        return [dict(p) for p in self._prompts]
+
+    @property
+    def resource_count(self) -> int:
+        """Number of discovered resources (no allocation)."""
+        return len(self._resources)
+
+    @property
+    def prompt_count(self) -> int:
+        """Number of discovered prompts (no allocation)."""
+        return len(self._prompts)
 
     def is_mcp_tool(self, func_name: str) -> bool:
         """Check whether *func_name* belongs to an MCP server."""
         return func_name in self._tool_map
+
+    def is_mcp_prompt(self, name: str) -> bool:
+        """Check whether *name* is a known MCP prompt."""
+        return name in self._prompt_map
 
     @property
     def server_count(self) -> int:
@@ -417,7 +868,10 @@ class MCPClientManager:
         future = asyncio.run_coroutine_threadsafe(
             session.call_tool(original_name, arguments), self._loop
         )
-        result = future.result(timeout=timeout)
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
 
         # Extract text from the content array
         texts: list[str] = []
@@ -434,6 +888,75 @@ class MCPClientManager:
         if getattr(result, "isError", False):
             output = f"Error: {output}"
         return output
+
+    # -- resource read -------------------------------------------------------
+
+    def read_resource_sync(self, uri: str, timeout: int = 120) -> str:
+        """Read a resource by URI synchronously (blocks the calling thread).
+
+        Returns text content for ``TextResourceContents``, or base64 data
+        for ``BlobResourceContents``.
+        """
+        mapping = self._resource_map.get(uri)
+        if mapping is None:
+            raise ValueError(f"Unknown MCP resource: {uri}")
+        server_name, _ = mapping
+        session = self._sessions.get(server_name)
+        if session is None:
+            raise RuntimeError(f"MCP server '{server_name}' is not connected")
+        assert self._loop is not None
+
+        future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"MCP resource read timed out after {timeout}s") from None
+
+        parts: list[str] = []
+        for item in result.contents:
+            if hasattr(item, "text"):
+                parts.append(item.text)
+            elif hasattr(item, "blob"):
+                parts.append(item.blob)
+            else:
+                parts.append(str(item))
+        return "\n".join(parts) if parts else "(empty resource)"
+
+    # -- prompt invocation ---------------------------------------------------
+
+    def get_prompt_sync(
+        self,
+        prefixed_name: str,
+        arguments: dict[str, str] | None = None,
+        timeout: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Invoke an MCP prompt synchronously and return expanded messages.
+
+        Returns a list of ``{role: str, content: str}`` dicts.
+        """
+        mapping = self._prompt_map.get(prefixed_name)
+        if mapping is None:
+            raise ValueError(f"Unknown MCP prompt: {prefixed_name}")
+        server_name, original_name = mapping
+        session = self._sessions.get(server_name)
+        if session is None:
+            raise RuntimeError(f"MCP server '{server_name}' is not connected")
+        assert self._loop is not None
+
+        future = asyncio.run_coroutine_threadsafe(
+            session.get_prompt(original_name, arguments=arguments), self._loop
+        )
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"MCP prompt retrieval timed out after {timeout}s") from None
+
+        messages: list[dict[str, Any]] = []
+        for msg in result.messages:
+            content = msg.content
+            text = content.text if hasattr(content, "text") else str(content)
+            messages.append({"role": msg.role, "content": text})
+        return messages
 
 
 # ---------------------------------------------------------------------------

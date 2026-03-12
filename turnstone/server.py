@@ -209,17 +209,21 @@ class WebUI:
 
                 storage = get_storage()
                 if storage is not None:
-                    tool_names = [it.get("func_name", "") for it in pending if it.get("func_name")]
+                    tool_names = [
+                        it.get("approval_label", "") or it.get("func_name", "")
+                        for it in pending
+                        if it.get("func_name")
+                    ]
                     if tool_names:
                         verdicts = evaluate_tool_policies_batch(storage, tool_names)
                         still_pending = []
                         for it in pending:
-                            fname = it.get("func_name", "")
-                            verdict = verdicts.get(fname)
+                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                            verdict = verdicts.get(policy_name)
                             if verdict == "deny":
                                 it["denied"] = True
                                 it["denial_msg"] = (
-                                    f"Blocked by tool policy (pattern match for '{fname}')"
+                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
                                 )
                             elif verdict == "allow":
                                 it["needs_approval"] = False
@@ -764,6 +768,13 @@ async def health(request: Request) -> JSONResponse:
             "circuit_state": monitor.circuit_state.value if monitor else "closed",
         },
     }
+    mc = getattr(request.app.state, "mcp_client", None)
+    if mc:
+        data["mcp"] = {
+            "servers": mc.server_count,
+            "resources": mc.resource_count,
+            "prompts": mc.prompt_count,
+        }
     return JSONResponse(data)
 
 
@@ -787,10 +798,19 @@ async def metrics_endpoint(request: Request) -> Response:
                     "context_ratio": ui._ws_context_ratio,
                 }
             )
+    mcp_info = None
+    mc = getattr(request.app.state, "mcp_client", None)
+    if mc:
+        mcp_info = {
+            "servers": mc.server_count,
+            "resources": mc.resource_count,
+            "prompts": mc.prompt_count,
+        }
     content = _metrics.generate_text(
         workstream_states=states,
         total_workstreams=len(wss),
         workstream_metrics=ws_data,
+        mcp_info=mcp_info,
     )
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
@@ -1813,6 +1833,7 @@ def main() -> None:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:
             log.info("MCP tools: %d from %d server(s)", len(mcp_tools), mcp_client.server_count)
+        mcp_client.set_storage(get_storage())
     log.info(
         "Health monitor: probe every %ss, circuit breaker threshold=%s",
         args.health_probe_interval,

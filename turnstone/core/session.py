@@ -24,6 +24,7 @@ import textwrap
 import threading
 import time
 import uuid
+from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -246,6 +247,8 @@ class ChatSession:
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
+        self._mcp_resource_cb: Any = None
+        self._mcp_prompt_cb: Any = None
         if mcp_client:
             mcp_tools = mcp_client.get_tools()
             self._tools = merge_mcp_tools(TOOLS, mcp_tools)
@@ -254,6 +257,12 @@ class ChatSession:
             # Register for tool-change notifications from MCP servers
             self._mcp_refresh_cb = self._on_mcp_tools_changed
             mcp_client.add_listener(self._mcp_refresh_cb)
+            # Register for resource-change notifications
+            self._mcp_resource_cb = self._on_mcp_resources_changed
+            mcp_client.add_resource_listener(self._mcp_resource_cb)
+            # Register for prompt-change notifications
+            self._mcp_prompt_cb = self._on_mcp_prompts_changed
+            mcp_client.add_prompt_listener(self._mcp_prompt_cb)
         else:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
@@ -333,6 +342,22 @@ class ChatSession:
         self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
         self._rebuild_tool_search()
 
+    def _on_mcp_resources_changed(self) -> None:
+        """Callback from MCPClientManager when the resource list changes.
+
+        Rebuilds the system message to update the resource catalog.
+        Called on the MCP background thread.
+        """
+        self._init_system_messages()
+
+    def _on_mcp_prompts_changed(self) -> None:
+        """Callback from MCPClientManager when the prompt list changes.
+
+        Rebuilds the system message to update the prompt catalog.
+        Called on the MCP background thread.
+        """
+        self._init_system_messages()
+
     def _rebuild_tool_search(self) -> None:
         """Reconstruct ToolSearchManager, preserving expanded tools."""
         old_expanded = self._tool_search.get_expanded_names() if self._tool_search else []
@@ -375,6 +400,12 @@ class ChatSession:
         if self._mcp_client and self._mcp_refresh_cb:
             self._mcp_client.remove_listener(self._mcp_refresh_cb)
             self._mcp_refresh_cb = None
+        if self._mcp_client and self._mcp_resource_cb:
+            self._mcp_client.remove_resource_listener(self._mcp_resource_cb)
+            self._mcp_resource_cb = None
+        if self._mcp_client and self._mcp_prompt_cb:
+            self._mcp_client.remove_prompt_listener(self._mcp_prompt_cb)
+            self._mcp_prompt_cb = None
         if self._watch_runner:
             self._watch_runner.remove_dispatch_fn(self._ws_id)
 
@@ -521,8 +552,12 @@ class ChatSession:
         Developer message contains tool patterns (or creative writing
         instructions when creative_mode is on), plus any user-supplied
         instructions and memory reminders.
+
+        Uses copy-on-write: builds new lists locally, then assigns
+        atomically so concurrent readers (e.g. background thread
+        callbacks) never see a partially-built system message.
         """
-        self.system_messages: list[dict[str, Any]] = []
+        new_system_messages: list[dict[str, Any]] = []
 
         # -- Chat template kwargs --
         self._chat_template_kwargs_base: dict[str, Any] = {
@@ -583,6 +618,38 @@ class ChatSession:
                     "\n\nAdditional tools are available via tool_search. "
                     "Use it when you need a capability not in your current tool set."
                 )
+        # MCP resource catalog (lets the model know what's available for read_resource)
+        # Only concrete resources — templates are not directly readable.
+        if self._mcp_client:
+            concrete = [r for r in self._mcp_client.get_resources() if not r.get("template")]
+            if concrete:
+                lines = ["\n<mcp-resources>"]
+                for r in concrete[:50]:
+                    safe_uri = _html_escape(r["uri"])
+                    desc = r.get("description", "")
+                    if desc:
+                        desc = f"  {_html_escape(desc[:100])}"
+                    lines.append(f"  {safe_uri}{desc}")
+                lines.append("</mcp-resources>")
+                lines.append("Use read_resource(uri='...') to access the resources listed above.")
+                dev_parts.append("\n".join(lines))
+        # MCP prompt catalog (lets the model know what's available for use_prompt)
+        if self._mcp_client:
+            prompts = self._mcp_client.get_prompts()
+            if prompts:
+                lines = ["<mcp-prompts>"]
+                for p in prompts[:30]:
+                    # Names/args are NOT escaped — model must use exact strings
+                    # in use_prompt(). Only description (display-only) is escaped.
+                    arg_names = ", ".join(a["name"] for a in p.get("arguments", []))
+                    desc = _html_escape(p.get("description", "")[:100])
+                    lines.append(f"  {p['name']}({arg_names})  {desc}")
+                lines.append("</mcp-prompts>")
+                lines.append(
+                    "Use use_prompt(name='...', arguments={...}) "
+                    "to invoke the prompts listed above."
+                )
+                dev_parts.append("\n".join(lines))
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
@@ -593,9 +660,11 @@ class ChatSession:
                 f"REMINDER: You currently have {len(memories)} memories stored. "
                 "Use recall to see them."
             )
-        self.system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
+        new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
+        # Atomic swap — readers see either old or new, never partial
+        self.system_messages = new_system_messages
         # Agent prefix: system + developer only (no memories)
-        self._agent_system_messages = list(self.system_messages)
+        self._agent_system_messages = list(new_system_messages)
 
     def _full_messages(self) -> list[dict[str, Any]]:
         """System messages + conversation history."""
@@ -1641,11 +1710,13 @@ class ChatSession:
                 "command",
                 "code",
                 "content",
+                "name",
                 "page",
                 "path",
                 "pattern",
                 "prompt",
                 "query",
+                "uri",
                 "url",
             ):
                 m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
@@ -1690,6 +1761,8 @@ class ChatSession:
             "forget": self._prepare_forget,
             "notify": self._prepare_notify,
             "watch": self._prepare_watch,
+            "read_resource": self._prepare_read_resource,
+            "use_prompt": self._prepare_use_prompt,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -2346,7 +2419,7 @@ class ChatSession:
             "header": f"\u2699 mcp:{display}",
             "preview": f"{DIM}{preview}{RESET}",
             "needs_approval": True,
-            "approval_label": "mcp_tool",
+            "approval_label": func_name,
             "execute": self._exec_mcp_tool,
             "mcp_func_name": func_name,
             "mcp_args": args,
@@ -2370,6 +2443,160 @@ class ChatSession:
 
         output = self._truncate_output(output)
         self.ui.on_tool_result(call_id, func_name, output)
+        return call_id, output
+
+    @staticmethod
+    def _normalize_resource_uri(uri: str) -> str:
+        """Normalize a resource URI for policy matching.
+
+        Decodes percent-encoded path segments (e.g. ``%2e%2e`` → ``..``)
+        then resolves ``..`` to prevent traversal bypasses where
+        ``file:///docs/%2e%2e/etc/passwd`` would match a policy
+        allowing ``mcp_resource__file:///docs/*``.
+        """
+        import posixpath
+        from urllib.parse import quote, unquote, urlparse, urlunparse
+
+        parsed = urlparse(uri)
+        if parsed.path:
+            decoded = unquote(parsed.path)
+            normalized = posixpath.normpath(decoded)
+            if parsed.path.startswith("/") and not normalized.startswith("/"):
+                normalized = "/" + normalized
+            parsed = parsed._replace(path=quote(normalized, safe="/"))
+        return urlunparse(parsed)
+
+    def _prepare_read_resource(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare an MCP resource read."""
+        uri = args.get("uri", "")
+        if not uri:
+            return {
+                "call_id": call_id,
+                "func_name": "read_resource",
+                "header": "\u2717 read_resource: missing uri",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Missing required parameter: uri",
+            }
+        if not self._mcp_client:
+            return {
+                "call_id": call_id,
+                "func_name": "read_resource",
+                "header": "\u2717 read_resource: no MCP servers",
+                "preview": "",
+                "needs_approval": False,
+                "error": "No MCP servers configured",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "read_resource",
+            "header": "\u2699 read_resource",
+            "preview": f"{DIM}    uri: {uri}{RESET}",
+            "needs_approval": True,
+            "approval_label": f"mcp_resource__{self._normalize_resource_uri(uri)}",
+            "execute": self._exec_read_resource,
+            "resource_uri": uri,
+        }
+
+    def _exec_read_resource(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Read an MCP resource by URI."""
+        call_id: str = item["call_id"]
+        uri: str = item["resource_uri"]
+
+        assert self._mcp_client is not None
+        try:
+            output = self._mcp_client.read_resource_sync(uri, timeout=self.tool_timeout)
+        except TimeoutError:
+            output = f"MCP resource read timed out after {self.tool_timeout}s"
+            self.ui.on_error(output)
+        except Exception:
+            log.warning("MCP resource read failed for %s", uri, exc_info=True)
+            output = "MCP resource error: failed to read resource"
+            self.ui.on_error(output)
+
+        output = self._truncate_output(output)
+        self.ui.on_tool_result(call_id, "read_resource", output)
+        return call_id, output
+
+    def _prepare_use_prompt(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare an MCP prompt invocation."""
+        name = args.get("name", "")
+        if not name:
+            return {
+                "call_id": call_id,
+                "func_name": "use_prompt",
+                "header": "\u2717 use_prompt: missing name",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Missing required parameter: name",
+            }
+        if not self._mcp_client:
+            return {
+                "call_id": call_id,
+                "func_name": "use_prompt",
+                "header": "\u2717 use_prompt: no MCP servers",
+                "preview": "",
+                "needs_approval": False,
+                "error": "No MCP servers configured",
+            }
+        if not self._mcp_client.is_mcp_prompt(name):
+            return {
+                "call_id": call_id,
+                "func_name": "use_prompt",
+                "header": f"\u2717 use_prompt: unknown prompt '{name}'",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Unknown MCP prompt: {name}",
+            }
+        raw_arguments = args.get("arguments") or {}
+        if not isinstance(raw_arguments, dict):
+            return {
+                "call_id": call_id,
+                "func_name": "use_prompt",
+                "header": "\u2717 use_prompt: arguments must be an object",
+                "preview": "",
+                "needs_approval": False,
+                "error": "arguments must be a JSON object with string values",
+            }
+        arguments = {str(k): str(v) for k, v in raw_arguments.items()}
+        preview_parts = [f"    {DIM}name: {name}"]
+        if arguments:
+            preview_parts.append(f"    arguments: {arguments}")
+        preview_parts.append(RESET)
+        return {
+            "call_id": call_id,
+            "func_name": "use_prompt",
+            "header": "\u2699 use_prompt",
+            "preview": "\n".join(preview_parts),
+            "needs_approval": True,
+            "approval_label": name,
+            "execute": self._exec_use_prompt,
+            "prompt_name": name,
+            "prompt_arguments": arguments,
+        }
+
+    def _exec_use_prompt(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Invoke an MCP prompt and return expanded messages."""
+        call_id: str = item["call_id"]
+        name: str = item["prompt_name"]
+        arguments: dict[str, str] = item["prompt_arguments"]
+
+        assert self._mcp_client is not None
+        try:
+            messages = self._mcp_client.get_prompt_sync(
+                name, arguments or None, timeout=self.tool_timeout
+            )
+            output = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
+        except TimeoutError:
+            output = f"MCP prompt timed out after {self.tool_timeout}s"
+            self.ui.on_error(output)
+        except Exception:
+            log.warning("MCP prompt invocation failed for %s", name, exc_info=True)
+            output = "MCP prompt error: failed to invoke prompt"
+            self.ui.on_error(output)
+
+        output = self._truncate_output(output)
+        self.ui.on_tool_result(call_id, "use_prompt", output)
         return call_id, output
 
     # -- Execute methods (do the work, report output via UI) -------------------
@@ -4062,15 +4289,36 @@ class ChatSession:
                 self._handle_mcp_refresh(arg)
             else:
                 tools = self._mcp_client.get_tools()
-                if not tools:
-                    self.ui.on_info("MCP client connected but no tools available.")
-                else:
-                    lines = [f"MCP tools ({len(tools)}):"]
+                resources = self._mcp_client.get_resources()
+                prompts = self._mcp_client.get_prompts()
+                mcp_lines = []
+                if tools:
+                    mcp_lines.append(f"MCP tools ({len(tools)}):")
                     for t in tools:
                         name = t["function"]["name"]
                         desc = t["function"].get("description", "")[:80]
-                        lines.append(f"  {name}  {dim(desc)}")
-                    self.ui.on_info("\n".join(lines))
+                        mcp_lines.append(f"  {name}  {dim(desc)}")
+                if resources:
+                    if mcp_lines:
+                        mcp_lines.append("")
+                    mcp_lines.append(f"MCP resources ({len(resources)}):")
+                    for r in resources:
+                        desc = r.get("description", "")[:80]
+                        mcp_lines.append(f"  {r['uri']}  {dim(desc)}")
+                if prompts:
+                    if mcp_lines:
+                        mcp_lines.append("")
+                    mcp_lines.append(f"MCP prompts ({len(prompts)}):")
+                    for p in prompts:
+                        arg_names = ", ".join(a["name"] for a in p.get("arguments", []))
+                        desc = p.get("description", "")[:60]
+                        mcp_lines.append(f"  {p['name']}({arg_names})  {dim(desc)}")
+                if not mcp_lines:
+                    self.ui.on_info(
+                        "MCP client connected but no tools, resources, or prompts available."
+                    )
+                else:
+                    self.ui.on_info("\n".join(mcp_lines))
 
         elif cmd == "/help":
             self.ui.on_info(
@@ -4094,7 +4342,7 @@ class ChatSession:
                         "  /reason [low|med|high] Set/show reasoning effort",
                         "  /creative              Toggle creative writing mode (no tools)",
                         "  /debug                 Toggle raw SSE delta logging",
-                        "  /mcp [refresh [server]] List or refresh MCP tools",
+                        "  /mcp [refresh [server]] List or refresh MCP tools, resources, and prompts",
                         "  /help                  Show this help",
                         "  /exit                  Exit (also: Ctrl+D)",
                         "────────────────────────────────────────────────────────",

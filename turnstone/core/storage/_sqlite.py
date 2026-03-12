@@ -1401,21 +1401,7 @@ class SQLiteBackend:
                 .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
                 .where(user_roles.c.user_id == user_id)
             ).fetchall()
-            return [
-                {
-                    "role_id": r[0],
-                    "name": r[1],
-                    "display_name": r[2],
-                    "permissions": r[3],
-                    "builtin": bool(r[4]),
-                    "org_id": r[5],
-                    "created": r[6],
-                    "updated": r[7],
-                    "assigned_by": r[8],
-                    "assignment_created": r[9],
-                }
-                for r in rows
-            ]
+            return [_row_to_dict(r, "builtin") for r in rows]
 
     def get_user_permissions(self, user_id: str) -> set[str]:
         with self._engine.connect() as conn:
